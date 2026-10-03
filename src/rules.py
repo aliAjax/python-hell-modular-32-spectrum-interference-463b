@@ -1,11 +1,12 @@
 import math
+from datetime import datetime, timezone
 
 from .domain import DomainError
 
 ENTITY_TYPE = "spectrum_interference"
 INITIAL_STATUS = "pending"
-CREATE_ROLES = {"analyst", "monitor"}
-SOURCE_ROLES = {"analyst", "monitor", "field_operator"}
+CREATE_ROLES = {"analyst", "monitor", "duty_officer"}
+SOURCE_ROLES = {"analyst", "monitor", "field_operator", "duty_officer", "regulator"}
 ACTION_ROLES = {
     "assess": {"analyst", "monitor"},
     "locate": {"field_operator", "analyst"},
@@ -14,10 +15,11 @@ ACTION_ROLES = {
     "resolve": {"coordinator", "regulator"},
     "correct_measurement": {"analyst", "monitor"},
     "cancel": {"coordinator"},
+    "review_cross_region": {"regulator"},
 }
 ENFORCE_REGION = True
 REGION_SENSITIVE_ACTIONS = {"suspend", "coordinate", "resolve", "cancel"}
-ACTION_REQUIRES_VERSION = {"suspend", "coordinate", "resolve", "cancel"}
+ACTION_REQUIRES_VERSION = {"suspend", "coordinate", "resolve", "cancel", "review_cross_region"}
 
 
 def assess(payload):
@@ -48,6 +50,12 @@ def _text(payload, name):
     return value.strip()
 
 
+def _require_cross_region_review(current):
+    # 跨区记录由监管角色复核，未复核前普通协调员不能处理。
+    if current.get("cross_region") and not current.get("cross_region_reviewed"):
+        raise DomainError("cross_region_review_required", "跨区记录需监管角色复核后才能处理", 403)
+
+
 def apply_action(item, action, payload, actor, role):
     status = item["status"]
     current = dict(item["payload"])
@@ -71,8 +79,10 @@ def apply_action(item, action, payload, actor, role):
         }
         current.setdefault("measurement_revisions", []).append(revision)
         current["strength_dbm"] = strength
-        current["assessment"] = assess(current)
-        return status, current, {"revision": revision}
+        # 测量数据更新后，评估和定位立即失效，处置人要按最新结果重新确认。
+        current.pop("assessment", None)
+        current.pop("location", None)
+        return "pending", current, {"revision": revision}
 
     if action == "locate":
         _need_status(item, {"assessed", "located"})
@@ -85,6 +95,7 @@ def apply_action(item, action, payload, actor, role):
 
     if action == "suspend":
         _need_status(item, {"located", "suspended"})
+        _require_cross_region_review(current)
         authorization = _text(payload, "authorization_code")
         if not authorization.startswith("REG-"):
             raise DomainError("invalid_authorization", "停用授权编号无效", 403)
@@ -93,6 +104,7 @@ def apply_action(item, action, payload, actor, role):
 
     if action == "coordinate":
         _need_status(item, {"suspended"})
+        _require_cross_region_review(current)
         agreement = _text(payload, "coordination_agreement")
         current["coordination_agreement"] = agreement
         current["coordination_note"] = payload.get("note", "")
@@ -100,6 +112,7 @@ def apply_action(item, action, payload, actor, role):
 
     if action == "resolve":
         _need_status(item, {"coordinating"})
+        _require_cross_region_review(current)
         if not payload.get("measurement_cleared"):
             raise DomainError("interference_present", "干扰尚未消除，不能结案", 409)
         current["resolution"] = {"evidence": _text(payload, "evidence"), "cleared": True}
@@ -107,8 +120,20 @@ def apply_action(item, action, payload, actor, role):
 
     if action == "cancel":
         _need_status(item, {"pending", "assessed"})
+        _require_cross_region_review(current)
         reason = _text(payload, "reason")
         current["cancellation"] = {"reason": reason, "actor": actor}
         return "cancelled", current, {"reason": reason}
+
+    if action == "review_cross_region":
+        # 跨区记录由监管角色复核，复核后普通协调员才能处理。
+        _need_status(item, {"pending", "assessed", "located", "suspended"})
+        current["cross_region_reviewed"] = True
+        current["cross_region_review"] = {
+            "actor": actor,
+            "role": role,
+            "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return status, current, {"cross_region_reviewed": True}
 
     raise DomainError("unknown_action", "不支持的操作")

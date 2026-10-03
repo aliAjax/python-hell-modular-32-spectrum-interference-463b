@@ -139,6 +139,70 @@ class Repository:
         finally:
             conn.close()
 
+    def merge_item(self, entity_type, stable_key, report, actor, role):
+        # 合并失败后值班员可以重试：整个合并在一个事务里完成，重试不会重复写入，
+        # 原事件和两条上报都还在。
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM items WHERE entity_type=? AND stable_key=?",
+                (entity_type, stable_key),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            item = self._row_to_item(row)
+            payload = item["payload"]
+            reports = payload.get("reports", [])
+            already = any(
+                r.get("station_id") == report["station_id"] and r.get("detected_at") == report["detected_at"]
+                for r in reports
+            )
+            if not already:
+                reports.append(report)
+                payload["reports"] = reports
+                # 后到的一条并进已有事件，各自测到的强度、时间和来源都留下，
+                # 顶层字段更新为最新一条，评估按最新结果重新确认。
+                payload["strength_dbm"] = report["strength_dbm"]
+                payload["detected_at"] = report["detected_at"]
+                payload["station_id"] = report["station_id"]
+                payload["reporter"] = report["reporter"]
+                payload["bandwidth_mhz"] = report["bandwidth_mhz"]
+                if report["region"] != payload.get("region"):
+                    payload["cross_region"] = True
+                payload.pop("assessment", None)
+                payload.pop("location", None)
+                version = item["version"] + 1
+                conn.execute(
+                    "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                    ("pending", version, canonical_json(payload), now_iso(), item["id"]),
+                )
+                self.append_audit(
+                    conn,
+                    item["id"],
+                    "report_merged",
+                    actor,
+                    role,
+                    {
+                        "station_id": report["station_id"],
+                        "strength_dbm": report["strength_dbm"],
+                        "detected_at": report["detected_at"],
+                    },
+                )
+                conn.execute("COMMIT")
+            else:
+                # 幂等：同一条上报重试不再重复写入。
+                conn.execute("COMMIT")
+            return self.get_item(item["id"])
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def get_item(self, item_id):
         conn = self.connect()
         try:
@@ -160,11 +224,11 @@ class Repository:
         finally:
             conn.close()
 
-    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role):
+    def add_source(self, item_id, source_type, external_id, payload, observed_at, actor, role, cross_region=False):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            item = conn.execute("SELECT id FROM items WHERE id=?", (item_id,)).fetchone()
+            item = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
             if item is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
             try:
@@ -175,6 +239,14 @@ class Repository:
             except sqlite3.IntegrityError:
                 raise ConflictError("duplicate_source", "同一来源记录已经提交")
             source_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            if cross_region:
+                # 跨区记录标记后由监管角色复核。
+                item_payload = json.loads(item["payload"])
+                item_payload["cross_region"] = True
+                conn.execute(
+                    "UPDATE items SET payload=?, updated_at=? WHERE id=?",
+                    (canonical_json(item_payload), now_iso(), item_id),
+                )
             self.append_audit(
                 conn,
                 item_id,

@@ -32,8 +32,22 @@ class FailureTest(unittest.TestCase):
 
     def test_duplicate_permission_and_region(self):
         item = self.service.create_item(self.payload, "m", "monitor")
-        with self.assertRaises(ConflictError):
-            self.service.create_item(self.payload, "m", "monitor")
+        # 同一频段的重复上报不再报错，而是并进已有事件，两条上报都留下。
+        merged = self.service.create_item(self.payload, "m", "monitor")
+        self.assertEqual(merged["id"], item["id"])
+        self.assertEqual(len(merged["payload"]["reports"]), 1)
+        # 两个监测站同时上报同一频段，后到的一条并进已有事件，各自测到的强度、时间和来源都留下。
+        other = dict(self.payload, station_id="ST-03", reporter="monitor-3", strength_dbm=-68)
+        merged = self.service.create_item(other, "m3", "monitor")
+        self.assertEqual(merged["id"], item["id"])
+        self.assertEqual(len(merged["payload"]["reports"]), 2)
+        stations = {r["station_id"] for r in merged["payload"]["reports"]}
+        self.assertEqual(stations, {"ST-02", "ST-03"})
+        strengths = {r["station_id"]: r["strength_dbm"] for r in merged["payload"]["reports"]}
+        self.assertEqual(strengths["ST-02"], -55)
+        self.assertEqual(strengths["ST-03"], -68)
+        # 合并后版本递增，用最新版本继续操作。
+        item = self.service.get_item(item["id"])
         item = self.service.act(item["id"], "assess", {}, "m", "monitor", item["version"])
         item = self.service.act(item["id"], "locate", {"location": "x", "confidence": 0.8}, "f", "field_operator", item["version"])
         with self.assertRaises(DomainError) as forbidden:

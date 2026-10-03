@@ -1,5 +1,5 @@
 from . import domain, rules
-from .domain import DomainError
+from .domain import DomainError, ConflictError
 
 
 class Service:
@@ -13,9 +13,22 @@ class Service:
             raise DomainError("forbidden", "当前角色不能创建此类业务记录", 403)
         normalized = domain.normalize_create(payload)
         stable_key = normalized.pop("_stable_key")
-        return self.repository.create_item(
-            rules.ENTITY_TYPE, stable_key, rules.INITIAL_STATUS, normalized, actor, role
-        )
+        report = {
+            "station_id": normalized["station_id"],
+            "region": normalized["region"],
+            "frequency_mhz": normalized["frequency_mhz"],
+            "bandwidth_mhz": normalized["bandwidth_mhz"],
+            "strength_dbm": normalized["strength_dbm"],
+            "detected_at": normalized["detected_at"],
+            "reporter": normalized["reporter"],
+        }
+        try:
+            return self.repository.create_item(
+                rules.ENTITY_TYPE, stable_key, rules.INITIAL_STATUS, normalized, actor, role
+            )
+        except ConflictError:
+            # 后到的一条并进已有事件，各自测到的强度、时间和来源都留下。
+            return self.repository.merge_item(rules.ENTITY_TYPE, stable_key, report, actor, role)
 
     def add_source(self, item_id, payload, actor, role, region=None):
         if not actor or not role:
@@ -26,6 +39,8 @@ class Service:
         normalized = domain.normalize_source(payload)
         if region and rules.ENFORCE_REGION and role != "regulator" and normalized.get("region") and normalized["region"] != region:
             raise DomainError("region_mismatch", "来源记录不属于当前管辖区域", 403)
+        # 来源来自其他区域时标记为跨区记录，由监管角色复核。
+        cross_region = bool(normalized.get("region")) and normalized["region"] != item["payload"].get("region")
         result = self.repository.add_source(
             item_id,
             normalized.pop("source_type"),
@@ -34,6 +49,7 @@ class Service:
             normalized.pop("observed_at"),
             actor,
             role,
+            cross_region=cross_region,
         )
         return result
 

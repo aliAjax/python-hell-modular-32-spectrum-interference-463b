@@ -57,7 +57,18 @@ def normalize_create(payload):
     strength = number(payload, "strength_dbm")
     detected_at = parse_timestamp(payload, "detected_at")
     reporter = require_text(payload, "reporter")
-    stable_key = "%s|%s|%s|%s" % (station_id, region, frequency, detected_at)
+    report = {
+        "station_id": station_id,
+        "region": region,
+        "frequency_mhz": frequency,
+        "bandwidth_mhz": bandwidth,
+        "strength_dbm": strength,
+        "detected_at": detected_at,
+        "reporter": reporter,
+    }
+    # 同一频段、同一区域、同一时间的上报视为同一事件，与具体监测站无关，
+    # 这样两个监测站同时上报同一频段时后到的一条会并进已有事件。
+    stable_key = "%s|%s|%s" % (region, frequency, detected_at)
     return {
         "frequency_mhz": frequency,
         "bandwidth_mhz": bandwidth,
@@ -68,6 +79,9 @@ def normalize_create(payload):
         "reporter": reporter,
         "measurement_revisions": [],
         "suspend_authorization": None,
+        "cross_region": False,
+        "cross_region_reviewed": False,
+        "reports": [report],
         "_stable_key": stable_key,
     }
 
