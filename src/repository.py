@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from .audit import audit_hash, canonical_json
 from .domain import ConflictError, NotFoundError, DomainError
+from . import rules
 
 
 def now_iso():
@@ -105,31 +106,70 @@ class Repository:
             (item_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
         )
 
-    def create_item(self, entity_type, stable_key, initial_status, payload, actor, role):
+    def _find_merge_candidate(self, conn, entity_type, payload):
+        placeholders = ",".join("?" for _ in rules.TERMINAL_STATUSES)
+        rows = conn.execute(
+            "SELECT * FROM items WHERE entity_type=? AND status NOT IN (%s) ORDER BY id" % placeholders,
+            (entity_type, *sorted(rules.TERMINAL_STATUSES)),
+        ).fetchall()
+        for row in rows:
+            item = self._row_to_item(row)
+            if rules.bands_overlap(item["payload"], payload):
+                return item
+        return None
+
+    def submit_report(self, entity_type, stable_key, initial_status, payload, report, actor, role):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    "INSERT INTO items(entity_type,stable_key,status,version,payload,created_by,created_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        entity_type,
-                        stable_key,
-                        initial_status,
-                        1,
-                        canonical_json(payload),
-                        actor,
-                        role,
-                        now_iso(),
-                        now_iso(),
-                    ),
-                )
-            except sqlite3.IntegrityError:
+            duplicate = conn.execute(
+                "SELECT id FROM items WHERE entity_type=? AND stable_key=?",
+                (entity_type, stable_key),
+            ).fetchone()
+            if duplicate is not None:
                 raise ConflictError("duplicate_item", "同一业务实体已经存在")
-            item_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-            self.append_audit(conn, item_id, "created", actor, role, {"stable_key": stable_key})
+            candidate = self._find_merge_candidate(conn, entity_type, payload)
+            if candidate is None:
+                try:
+                    conn.execute(
+                        "INSERT INTO items(entity_type,stable_key,status,version,payload,created_by,created_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (
+                            entity_type,
+                            stable_key,
+                            initial_status,
+                            1,
+                            canonical_json(payload),
+                            actor,
+                            role,
+                            now_iso(),
+                            now_iso(),
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    raise ConflictError("duplicate_item", "同一业务实体已经存在")
+                item_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                self.append_audit(conn, item_id, "created", actor, role, {"stable_key": stable_key})
+                conn.execute("COMMIT")
+                return self.get_item(item_id), True
+            already = conn.execute(
+                "SELECT id FROM sources WHERE item_id=? AND source_type=? AND external_id=?",
+                (candidate["id"], rules.REPORT_SOURCE_TYPE, stable_key),
+            ).fetchone()
+            if already is not None:
+                conn.execute("COMMIT")
+                return self.get_item(candidate["id"]), False
+            new_status, new_payload, event_payload = rules.merge_report(candidate, report)
+            conn.execute(
+                "UPDATE items SET status=?,version=?,payload=?,updated_at=? WHERE id=?",
+                (new_status, int(candidate["version"]) + 1, canonical_json(new_payload), now_iso(), candidate["id"]),
+            )
+            conn.execute(
+                "INSERT INTO sources(item_id,source_type,external_id,payload,observed_at,created_at) VALUES(?,?,?,?,?,?)",
+                (candidate["id"], rules.REPORT_SOURCE_TYPE, stable_key, canonical_json(report), report["detected_at"], now_iso()),
+            )
+            self.append_audit(conn, candidate["id"], "merged", actor, role, event_payload)
             conn.execute("COMMIT")
-            return self.get_item(item_id)
+            return self.get_item(candidate["id"]), False
         except Exception:
             try:
                 conn.execute("ROLLBACK")

@@ -18,6 +18,9 @@ ACTION_ROLES = {
 ENFORCE_REGION = True
 REGION_SENSITIVE_ACTIONS = {"suspend", "coordinate", "resolve", "cancel"}
 ACTION_REQUIRES_VERSION = {"suspend", "coordinate", "resolve", "cancel"}
+TERMINAL_STATUSES = {"resolved", "cancelled"}
+INVALIDATED_ON_MEASUREMENT_UPDATE = ("assessment", "location")
+REPORT_SOURCE_TYPE = "station_report"
 
 
 def assess(payload):
@@ -39,6 +42,61 @@ def assess(payload):
 def _need_status(item, allowed):
     if item["status"] not in allowed:
         raise DomainError("invalid_state", "当前状态 %s 不允许执行该操作" % item["status"])
+
+
+def bands_overlap(first, second):
+    first_center = float(first.get("frequency_mhz", 0))
+    second_center = float(second.get("frequency_mhz", 0))
+    first_width = max(float(first.get("bandwidth_mhz", 0)), 0.0)
+    second_width = max(float(second.get("bandwidth_mhz", 0)), 0.0)
+    return abs(first_center - second_center) * 2.0 <= (first_width + second_width)
+
+
+def build_report(normalized):
+    return {
+        "station_id": normalized["station_id"],
+        "region": normalized["region"],
+        "strength_dbm": normalized["strength_dbm"],
+        "detected_at": normalized["detected_at"],
+        "reporter": normalized["reporter"],
+        "frequency_mhz": normalized["frequency_mhz"],
+        "bandwidth_mhz": normalized["bandwidth_mhz"],
+    }
+
+
+def invalidate_measurements(current):
+    invalidated = []
+    for key in INVALIDATED_ON_MEASUREMENT_UPDATE:
+        if key in current:
+            current.pop(key)
+            invalidated.append(key)
+    return invalidated
+
+
+def merge_report(item, report):
+    current = dict(item["payload"])
+    reports = list(current.get("reports") or [])
+    if not reports:
+        reports.append(build_report(current))
+    reports.append(report)
+    current["reports"] = reports
+    current["regions"] = sorted({entry.get("region") for entry in reports if entry.get("region")})
+    current["strength_dbm"] = report["strength_dbm"]
+    current["detected_at"] = report["detected_at"]
+    current["bandwidth_mhz"] = report["bandwidth_mhz"]
+    current["station_id"] = report["station_id"]
+    current["reporter"] = report["reporter"]
+    invalidated = invalidate_measurements(current)
+    status = item["status"]
+    if status in {"assessed", "located"}:
+        status = INITIAL_STATUS
+    event = {
+        "report": report,
+        "merged_into": item["id"],
+        "reports_total": len(reports),
+        "invalidated": invalidated,
+    }
+    return status, current, event
 
 
 def _text(payload, name):
@@ -71,8 +129,8 @@ def apply_action(item, action, payload, actor, role):
         }
         current.setdefault("measurement_revisions", []).append(revision)
         current["strength_dbm"] = strength
-        current["assessment"] = assess(current)
-        return status, current, {"revision": revision}
+        invalidated = invalidate_measurements(current)
+        return INITIAL_STATUS, current, {"revision": revision, "invalidated": invalidated}
 
     if action == "locate":
         _need_status(item, {"assessed", "located"})

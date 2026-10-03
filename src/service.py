@@ -7,14 +7,21 @@ class Service:
         self.repository = repository
 
     def create_item(self, payload, actor, role, region=None):
+        item, _created = self.submit_report(payload, actor, role, region)
+        return item
+
+    def submit_report(self, payload, actor, role, region=None):
         if not actor or not role:
             raise DomainError("identity_required", "需要用户身份和角色", 401)
         if role not in rules.CREATE_ROLES:
             raise DomainError("forbidden", "当前角色不能创建此类业务记录", 403)
         normalized = domain.normalize_create(payload)
         stable_key = normalized.pop("_stable_key")
-        return self.repository.create_item(
-            rules.ENTITY_TYPE, stable_key, rules.INITIAL_STATUS, normalized, actor, role
+        report = rules.build_report(normalized)
+        normalized["reports"] = [report]
+        normalized["regions"] = [normalized["region"]]
+        return self.repository.submit_report(
+            rules.ENTITY_TYPE, stable_key, rules.INITIAL_STATUS, normalized, report, actor, role
         )
 
     def add_source(self, item_id, payload, actor, role, region=None):
@@ -44,8 +51,14 @@ class Service:
         allowed = rules.ACTION_ROLES.get(action, set())
         if role not in allowed:
             raise DomainError("forbidden", "当前角色不能执行该操作", 403)
-        if rules.ENFORCE_REGION and action in rules.REGION_SENSITIVE_ACTIONS and region and role != "regulator":
-            if item["payload"].get("region") != region:
+        if rules.ENFORCE_REGION and action in rules.REGION_SENSITIVE_ACTIONS:
+            regions = item["payload"].get("regions") or []
+            if not regions and item["payload"].get("region"):
+                regions = [item["payload"]["region"]]
+            if len(regions) > 1:
+                if role != "regulator":
+                    raise DomainError("regulator_required", "跨区记录需监管角色复核", 403)
+            elif region and role != "regulator" and item["payload"].get("region") != region:
                 raise DomainError("region_mismatch", "不能处理其他区域的记录", 403)
         if action in rules.ACTION_REQUIRES_VERSION and expected_version is None:
             raise DomainError("expected_version_required", "该操作需要 expected_version", 400)
